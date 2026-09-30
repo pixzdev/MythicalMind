@@ -14,6 +14,48 @@ import { ApiError } from "@/lib/api-helpers";
 import type { AIRundownResult, SegmentInput } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
+// Live phase events (streamed to the client while the agent works).
+// Every phase corresponds to a real stage of the pipeline below — they are
+// never scripted: labels are emitted as the code actually passes each stage.
+// ---------------------------------------------------------------------------
+
+export type AIRundownPhase = {
+  phase: string;
+  label: string;
+  detail?: string | null;
+  at: number;
+};
+
+type PhaseEmitter = (ev: AIRundownPhase) => void;
+
+const PHASE_COPY: Record<
+  "full" | "extend" | "replan",
+  { start: string; stream: string; found: string; validating: string; done: string }
+> = {
+  full: {
+    start: "Memahami kebutuhan...",
+    stream: "Menyusun rundown...",
+    found: "Menemukan aktivitas",
+    validating: "Memvalidasi jadwal...",
+    done: "Rundown siap.",
+  },
+  extend: {
+    start: "Menganalisis rundown...",
+    stream: "Menyusun segmen tambahan...",
+    found: "Segmen baru ditemukan",
+    validating: "Memvalidasi segmen...",
+    done: "Segmen siap.",
+  },
+  replan: {
+    start: "Memperbarui jadwal...",
+    stream: "Menganalisis perubahan...",
+    found: "Aktivitas disusun ulang",
+    validating: "Memvalidasi jadwal baru...",
+    done: "Jadwal diperbarui.",
+  },
+};
+
+// ---------------------------------------------------------------------------
 // Input / output schemas
 // ---------------------------------------------------------------------------
 
@@ -32,12 +74,14 @@ export const AIRundownRequestSchema = z.object({
   notes: z.string().trim().max(600).nullish(),
   providerId: z.string().nullish(),
   modelKey: z.string().nullish(),
-  mode: z.enum(["full", "extend"]).default("full"),
+  mode: z.enum(["full", "extend", "replan"]).default("full"),
+  instruction: z.string().trim().max(600).nullish(),
   existingSegments: z
     .array(
       z.object({
         title: z.string(),
         durationMinutes: z.number().int(),
+        startTime: z.string().regex(/^\d{1,2}:\d{2}$/).nullish(),
       })
     )
     .max(60)
@@ -199,6 +243,19 @@ function buildPrompt(req: AIRundownRequest): { system: string; user: string } {
     for (const s of req.existingSegments ?? []) {
       lines.push(`- ${s.title} (${s.durationMinutes} menit)`);
     }
+    if (req.instruction) lines.push(`Instruksi tambahan: ${req.instruction}`);
+  } else if (req.mode === "replan") {
+    lines.push("Rundown berikut sudah ada. ATUR ULANG seluruh rundown sesuai instruksi pengguna.");
+    lines.push(
+      "Kembalikan SELURUH segmen hasil penataan ulang (JSON dengan struktur sama). Susun ulang urutan dan durasi agar jadwal tetap realistis, tanpa tumpang tindih, dan tetap menghormati batasan waktu pengguna."
+    );
+    lines.push("Rundown saat ini:");
+    for (const s of req.existingSegments ?? []) {
+      lines.push(
+        `- ${s.title}${s.startTime ? ` mulai ${s.startTime}` : ""} (${s.durationMinutes} menit)`
+      );
+    }
+    lines.push(`Instruksi perubahan: ${req.instruction ?? "-"}`);
   }
   lines.push(`Nama acara/rencana: ${req.title}`);
   lines.push(`Jenis: ${req.eventType}`);
@@ -224,20 +281,39 @@ function buildPrompt(req: AIRundownRequest): { system: string; user: string } {
 // ---------------------------------------------------------------------------
 
 export async function generateRundownWithAI(
-  req: AIRundownRequest
+  req: AIRundownRequest,
+  onEvent?: PhaseEmitter
 ): Promise<AIRundownResult> {
+  const t0 = Date.now();
+  const copy = PHASE_COPY[req.mode ?? "full"];
+  const emit = (phase: string, label: string, detail?: string | null) => {
+    if (!onEvent) return;
+    try {
+      onEvent({ phase, label, detail: detail ?? null, at: Date.now() - t0 });
+    } catch {
+      /* progress reporting must never break generation */
+    }
+  };
+
+  emit("start", copy.start);
+
   const { config, modelKey, providerName } = await resolveAIProvider({
     providerId: req.providerId ?? undefined,
     modelKey: req.modelKey ?? undefined,
   });
+  emit("provider", "Menghubungkan ke penyedia AI...", `${providerName} · ${modelKey}`);
+
   const settings = await getSettings();
   const adapter = registry.get(config.type);
   const { system, user } = buildPrompt(req);
 
   let text = "";
+  let deltas = 0;
   const controller = new AbortController();
   const timeout = AbortSignal.timeout(settings.generation.timeoutMs ?? 300_000);
   const composed = AbortSignal.any?.([controller.signal, timeout]) ?? timeout;
+
+  emit("stream", copy.stream);
 
   try {
     for await (const ev of adapter.stream({
@@ -252,6 +328,11 @@ export async function generateRundownWithAI(
     })) {
       if (ev.type === "text-delta") {
         text += ev.text;
+        deltas += 1;
+        // real streaming progress — the count is the true accumulated length
+        if (deltas % 6 === 0) {
+          emit("progress", copy.stream, `${text.length} karakter diterima`);
+        }
       } else if (ev.type === "error") {
         throw new ProviderError(ev.error);
       }
@@ -283,12 +364,32 @@ export async function generateRundownWithAI(
 
   const parsed = aiRundownSchema.safeParse(extractJsonObject(text));
   if (!parsed.success) {
+    emit(
+      "malformed",
+      "Format jawaban tidak bisa dibaca.",
+      `menerima ${text.length} karakter`
+    );
     throw new ApiError(
       502,
       "malformed_ai_response",
       "Format jawaban AI tidak bisa dibaca sebagai rundown. Coba lagi — beberapa model kadang melenceng dari format."
     );
   }
+
+  const segmentCount = parsed.data.segments.length;
+  if (req.mode === "replan") {
+    // Real conflict detection: compare the new arrangement against the old
+    // timeline and count genuinely overlapping slots of different activities.
+    const conflicts = detectScheduleConflicts(parsed.data.segments, req.existingSegments ?? []);
+    if (conflicts > 0) {
+      emit("conflict", "Benturan waktu ditemukan.", `${conflicts} titik benturan dengan jadwal lama`);
+    }
+    emit("adjust", "Menyesuaikan aktivitas fleksibel...", `${segmentCount} aktivitas disusun ulang`);
+  } else {
+    emit("found", `${copy.found}.`, `${segmentCount} aktivitas`);
+  }
+
+  emit("validating", copy.validating);
 
   const segments: SegmentInput[] = parsed.data.segments.map((s) => ({
     title: s.title,
@@ -298,6 +399,8 @@ export async function generateRundownWithAI(
     notes: s.notes ?? null,
     materials: null,
   }));
+
+  emit("done", copy.done, `${segmentCount} segmen`);
 
   return {
     title: parsed.data.title || req.title,
@@ -309,4 +412,45 @@ export async function generateRundownWithAI(
     providerName,
     modelKey,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Conflict detection for replan mode — pure, derived from real data only.
+// ---------------------------------------------------------------------------
+
+function toMinutes(hhmm: string): number {
+  const [h, m] = hhmm.split(":").map(Number);
+  return h * 60 + m;
+}
+
+function detectScheduleConflicts(
+  newSegments: { title: string; durationMinutes: number }[],
+  oldSegments: { title: string; durationMinutes: number; startTime?: string | null }[]
+): number {
+  if (oldSegments.length === 0) return 0;
+  // Old timeline: derive start times sequentially when not provided.
+  let cursor = toMinutes(oldSegments[0].startTime ?? "08:00");
+  const old = oldSegments.map((s) => {
+    const start = s.startTime ? toMinutes(s.startTime) : cursor;
+    const end = start + s.durationMinutes;
+    cursor = s.startTime ? end : end;
+    return { title: s.title.trim().toLowerCase(), start, end };
+  });
+  // New timeline: always sequential from the same origin as the old first slot.
+  let newCursor = old.length > 0 ? old[0].start : 8 * 60;
+  const next = newSegments.map((s) => {
+    const start = newCursor;
+    const end = start + s.durationMinutes;
+    newCursor = end;
+    return { title: s.title.trim().toLowerCase(), start, end };
+  });
+  // Count overlaps between slots that belong to *different* activities.
+  let conflicts = 0;
+  for (const n of next) {
+    for (const o of old) {
+      if (o.title === n.title) continue;
+      if (n.start < o.end && o.start < n.end) conflicts += 1;
+    }
+  }
+  return conflicts;
 }

@@ -37,20 +37,91 @@ function isRundownRequest(system, prompt) {
   );
 }
 
+// Demo scenarios for the HackFest film — deterministic, clearly part of the
+// mock test double. The product pipeline (prompt → SSE → parse → validate
+// → timeline) is fully real; these only fix the model's answer.
+
+const SCENARIO_FULL = {
+  title: "Hari produktif besok",
+  description: "Rencana satu hari penuh: sekolah, meeting, belajar, project, dan tidur sebelum jam 11 malam.",
+  suggestedStartTime: "07:00",
+  segments: [
+    { title: "Sekolah", durationMinutes: 480, description: "Kegiatan belajar mengajar penuh di sekolah.", pic: null, notes: "Bawa bekal dan tugas matematika." },
+    { title: "Pulang & pemulihan", durationMinutes: 60, description: "Perjalanan pulang, makan ringan, dan jeda pemulihan energi.", pic: null, notes: "Cek notifikasi meeting sekali saja." },
+    { title: "Meeting", durationMinutes: 60, description: "Meeting online dengan tim — agenda mingguan dan pembagian tugas.", pic: "Kamu", notes: "Siapkan catatan poin pembahasan." },
+    { title: "Jeda sejenak", durationMinutes: 30, description: "Istirahat bebas sebelum masuk mode belajar.", pic: null, notes: null },
+    { title: "Belajar matematika", durationMinutes: 90, description: "Fokus mengerjakan latihan dan rangkuman materi.", pic: null, notes: "HP diletakkan jauh." },
+    { title: "Makan malam", durationMinutes: 45, description: "Makan bersama keluarga.", pic: null, notes: null },
+    { title: "Kerjakan project coding", durationMinutes: 120, description: "Sesi fokus menyelesaikan fitur yang belum selesai.", pic: null, notes: "Target: satu fitur jalan malam ini." },
+    { title: "Mandi & bersiap tidur", durationMinutes: 30, description: "Rutinitas malam.", pic: null, notes: null },
+    { title: "Wind down sebelum tidur", durationMinutes: 45, description: "Baca ringan, tarik napas, layar dimatikan.", pic: null, notes: "Tidur sebelum 23:00." },
+  ],
+};
+
+const SCENARIO_REPLAN_MEETING = {
+  title: "Hari produktif besok",
+  description: "Jadwal disusun ulang: meeting pindah ke jam 17:00, kegiatan lain menyesuaikan.",
+  suggestedStartTime: "07:00",
+  segments: [
+    { title: "Sekolah", durationMinutes: 480, description: "Kegiatan belajar mengajar penuh di sekolah.", pic: null, notes: null },
+    { title: "Pulang & pemulihan", durationMinutes: 120, description: "Perjalanan pulang dan jeda panjang karena meeting digeser ke 17:00.", pic: null, notes: null },
+    { title: "Meeting", durationMinutes: 60, description: "Meeting online dengan tim — mulai jam 17:00.", pic: "Kamu", notes: "Catat keputusan penting." },
+    { title: "Belajar matematika", durationMinutes: 90, description: "Sesi belajar setelah meeting.", pic: null, notes: "Fokus latihan soal." },
+    { title: "Makan malam", durationMinutes: 45, description: "Makan bersama keluarga.", pic: null, notes: null },
+    { title: "Kerjakan project coding", durationMinutes: 105, description: "Durasi disesuaikan agar tetap selesai sebelum persiapan tidur.", pic: null, notes: null },
+    { title: "Mandi & bersiap tidur", durationMinutes: 30, description: "Rutinitas malam.", pic: null, notes: null },
+    { title: "Wind down sebelum tidur", durationMinutes: 30, description: "Relaksasi singkat, tidur sebelum 23:00.", pic: null, notes: null },
+  ],
+};
+
+const SCENARIO_REPLAN_REST = {
+  title: "Hari produktif besok",
+  description: "Jadwal disusun ulang: ditambah 30 menit waktu istirahat, project coding disesuaikan.",
+  suggestedStartTime: "07:00",
+  segments: [
+    { title: "Sekolah", durationMinutes: 480, description: "Kegiatan belajar mengajar penuh di sekolah.", pic: null, notes: null },
+    { title: "Pulang & pemulihan", durationMinutes: 120, description: "Perjalanan pulang dan jeda pemulihan.", pic: null, notes: null },
+    { title: "Meeting", durationMinutes: 60, description: "Meeting online dengan tim — mulai jam 17:00.", pic: "Kamu", notes: null },
+    { title: "Belajar matematika", durationMinutes: 90, description: "Sesi belajar setelah meeting.", pic: null, notes: null },
+    { title: "Makan malam", durationMinutes: 45, description: "Makan bersama keluarga.", pic: null, notes: null },
+    { title: "Istirahat", durationMinutes: 30, description: "Waktu istirahat ekstra — jalan sejenak, minum, rehat mata.", pic: null, notes: "Tanpa layar." },
+    { title: "Kerjakan project coding", durationMinutes: 75, description: "Durasi dipadatkan agar semua kegiatan tetap muat.", pic: null, notes: null },
+    { title: "Mandi & bersiap tidur", durationMinutes: 30, description: "Rutinitas malam.", pic: null, notes: null },
+    { title: "Wind down sebelum tidur", durationMinutes: 30, description: "Relaksasi singkat, tidur sebelum 23:00.", pic: null, notes: null },
+  ],
+};
+
+function isDemoScenario(prompt) {
+  return (
+    /sekolah/i.test(prompt) &&
+    /meeting/i.test(prompt) &&
+    /(matematika|coding)/i.test(prompt)
+  );
+}
+
 function buildRundownChunks(system, prompt) {
+  // replan mode (demo scenario): re-arranged full schedule
+  if (prompt.includes("ATUR ULANG")) {
+    const obj = /istirahat/i.test(prompt) ? SCENARIO_REPLAN_REST : SCENARIO_REPLAN_MEETING;
+    return { chunks: chunkify(JSON.stringify(obj), 60), delay: 200 };
+  }
+  // full mode (demo scenario): the messy school-day input
+  if (isDemoScenario(prompt)) {
+    return { chunks: chunkify(JSON.stringify(SCENARIO_FULL), 60), delay: 200 };
+  }
   // extend mode: only additional segments
   if (prompt.includes("TAMBAHKAN segmen")) {
-    const obj = {
-      title: "Segmen tambahan",
-      description: null,
-      suggestedStartTime: null,
-      segments: [
-        { title: "Sesi door prize", durationMinutes: 15, description: "Undian hadiah untuk peserta.", pic: "MC", notes: null },
-        { title: "Arak-arakan penutup", durationMinutes: 10, description: "Konfeti dan foto bersama.", pic: "Tim Acara", notes: "Siapkan konfeti." },
-      ],
-    };
-    return chunkify(JSON.stringify(obj), 90);
-  }
+  const obj = {
+    title: "Segmen tambahan",
+    description: null,
+    suggestedStartTime: null,
+    segments: [
+      { title: "Sesi door prize", durationMinutes: 15, description: "Undian hadiah untuk peserta.", pic: "MC", notes: null },
+      { title: "Arak-arakan penutup", durationMinutes: 10, description: "Konfeti dan foto bersama.", pic: "Tim Acara", notes: "Siapkan konfeti." },
+    ],
+  };
+  return { chunks: chunkify(JSON.stringify(obj), 90), delay: 25 };
+}
   const titleMatch = prompt.match(/Nama acara\/rencana: (.+)/);
   const title = (titleMatch?.[1] ?? "Acara")?.split("\n")[0];
   const startMatch = prompt.match(/Jam mulai: (\d{1,2}:\d{2})/);
@@ -69,7 +140,7 @@ function buildRundownChunks(system, prompt) {
       { title: "Penutupan & foto", durationMinutes: 20, description: "Ucapan terima kasih dan dokumentasi.", pic: "MC + Dokumentasi", notes: null },
     ],
   };
-  return chunkify(JSON.stringify(obj), 90);
+  return { chunks: chunkify(JSON.stringify(obj), 90), delay: 25 };
 }
 
 function chunkify(text, size) {
@@ -178,12 +249,12 @@ const server = http.createServer((req, res) => {
       }
 
       const wantsUsage = Boolean(json.stream_options?.include_usage);
-      const chunks = rundownMode
+      const built = rundownMode
         ? buildRundownChunks(systemMsg, prompt)
-        : buildChunks(model, prompt);
-      const chunkDelay = rundownMode
-        ? 25
-        : model === "aurora-slow" ? 700 : model === "aurora-long" ? 400 : model === "aurora-pro" ? 45 : 60;
+        : { chunks: buildChunks(model, prompt), delay: null };
+      const chunks = built.chunks;
+      const chunkDelay = built.delay ??
+        (model === "aurora-slow" ? 700 : model === "aurora-long" ? 400 : model === "aurora-pro" ? 45 : 60);
       const hasReasoning = model === "aurora-reasoner";
 
       // non-streaming

@@ -54,7 +54,8 @@ import {
   useReorderSegments,
   useDuplicateRundown,
   useDeleteRundown,
-  useGenerateRundownAI,
+  useAIRundownStream,
+  useReplaceSegments,
 } from "@/hooks/mythicalmind/rundown-queries";
 import { useWorkspace } from "@/store/workspace-store";
 import {
@@ -65,7 +66,7 @@ import {
   sanitizeDurationInput,
 } from "@/lib/rundown/time";
 import { exportRundownPDF } from "@/lib/rundown/pdf";
-import { RUNDOWN_CATEGORY_LABELS, type RundownDetail, type TimelineSlot } from "@/lib/types";
+import { RUNDOWN_CATEGORY_LABELS, type AIRundownResult, type RundownDetail, type TimelineSlot } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
@@ -375,7 +376,10 @@ const SegmentRow = memo(function SegmentRow({
 });
 
 // ---------------------------------------------------------------------------
-// AI extend dialog
+// AI adjust dialog — two real agent modes over the existing rundown:
+// "extend" (append missing segments) and "replan" (re-arrange the whole
+// schedule from a natural-language change). Live phases stream from the
+// server; the replan result is previewed and applied atomically.
 // ---------------------------------------------------------------------------
 
 function AIExtendDialog({
@@ -387,92 +391,240 @@ function AIExtendDialog({
   onOpenChange: (v: boolean) => void;
   rundown: RundownDetail;
 }) {
-  const generateAI = useGenerateRundownAI();
+  const ai = useAIRundownStream();
   const addSegment = useAddSegment();
+  const replaceSegments = useReplaceSegments();
+  const [mode, setMode] = useState<"extend" | "replan">("replan");
   const [instruction, setInstruction] = useState("");
+  const [preview, setPreview] = useState<AIRundownResult | null>(null);
 
   const timeline = computeTimeline(rundown, rundown.segments);
+  const applying = addSegment.isPending || replaceSegments.isPending;
 
-  const run = () => {
+  const run = async () => {
     if (!instruction.trim()) return;
-    generateAI.mutate(
-      {
-        title: rundown.title,
-        eventType: rundown.eventType,
-        category: rundown.category,
-        startTime: rundown.startTime,
-        mode: "extend",
-        notes: instruction.trim(),
-        existingSegments: rundown.segments.map((s) => ({
+    setPreview(null);
+    const r = await ai.run({
+      title: rundown.title,
+      eventType: rundown.eventType,
+      category: rundown.category,
+      startTime: rundown.startTime,
+      mode,
+      instruction: instruction.trim(),
+      existingSegments: rundown.segments.map((s, i) => ({
+        title: s.title,
+        durationMinutes: s.durationMinutes,
+        startTime: timeline[i]?.startTime ?? null,
+      })),
+    });
+    if (r) setPreview(r);
+  };
+
+  const apply = () => {
+    if (!preview) return;
+    if (mode === "replan") {
+      replaceSegments.mutate(
+        {
+          rundownId: rundown.id,
+          segments: preview.segments.map((s) => ({
+            title: s.title,
+            durationMinutes: s.durationMinutes,
+            description: s.description,
+            pic: s.pic,
+            notes: s.notes,
+          })),
+        },
+        {
+          onSuccess: () => {
+            toast.success(`Jadwal diperbarui — ${preview.segments.length} segmen diterapkan`);
+            setInstruction("");
+            setPreview(null);
+            onOpenChange(false);
+          },
+        }
+      );
+      return;
+    }
+    const segments = preview.segments;
+    const append = async () => {
+      for (const s of segments) {
+        await addSegment.mutateAsync({
+          rundownId: rundown.id,
           title: s.title,
           durationMinutes: s.durationMinutes,
-        })),
-      },
-      {
-        onSuccess: (data) => {
-          // append returned segments sequentially
-          const segments = data.rundown.segments;
-          const append = async () => {
-            for (const s of segments) {
-              await addSegment.mutateAsync({
-                rundownId: rundown.id,
-                title: s.title,
-                durationMinutes: s.durationMinutes,
-                description: s.description,
-                pic: s.pic,
-                notes: s.notes,
-              });
-            }
-          };
-          void append().then(() => {
-            toast.success(`${segments.length} segmen AI ditambahkan`);
-            setInstruction("");
-            onOpenChange(false);
-          });
-        },
+          description: s.description,
+          pic: s.pic,
+          notes: s.notes,
+        });
       }
-    );
+    };
+    void append().then(() => {
+      toast.success(`${segments.length} segmen AI ditambahkan`);
+      setInstruction("");
+      setPreview(null);
+      onOpenChange(false);
+    });
   };
+
+  const placeholder =
+    mode === "replan"
+      ? "mis. meeting-nya pindah jam 17.00, sisanya sesuaikan"
+      : "mis. tambahkan sesi door prize setelah talkshow dan arak-arakan penutup";
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="glass rounded-2xl border-white/10 max-w-[480px] p-0 top-[22%] translate-y-0">
+      <DialogContent className="glass rounded-2xl border-white/10 max-w-[520px] p-0 top-[14%] translate-y-0">
         <div className="p-5 space-y-3.5">
           <DialogTitle className="text-[15.5px] font-semibold flex items-center gap-2.5">
             <span className="size-8 rounded-lg bg-[var(--aurora-accent)]/15 border border-[var(--aurora-accent)]/25 flex items-center justify-center">
               <Sparkles className="size-4 text-[var(--aurora-accent)]" />
             </span>
-            Tambah segmen dengan AI
+            Sesuaikan jadwal dengan AI
           </DialogTitle>
           <DialogDescription className="text-[12.5px] leading-relaxed">
-            Ceritakan bagian apa yang masih kurang. AI mengetahui {rundown.segments.length} segmen
-            yang sudah ada (total {formatDurationIndo(rundown.totalMinutes)}
-            {timeline.length > 0 && `, berakhir ${endTimeOf(rundown)}`}) dan hanya menambahkan yang baru.
+            AI mengetahui {rundown.segments.length} segmen yang sudah ada (total{" "}
+            {formatDurationIndo(rundown.totalMinutes)}
+            {timeline.length > 0 && `, berakhir ${endTimeOf(rundown)}`}). Pilih mode lalu tulis
+            perubahannya.
           </DialogDescription>
+
+          <div className="grid grid-cols-2 gap-1.5 p-1 rounded-xl bg-white/[0.04] border border-white/10" role="tablist">
+            {(
+              [
+                { key: "replan", label: "Atur ulang jadwal", hint: "pindah / ubah durasi / rapikan" },
+                { key: "extend", label: "Tambah segmen", hint: "tambah kegiatan baru" },
+              ] as const
+            ).map((opt) => (
+              <button
+                key={opt.key}
+                role="tab"
+                aria-selected={mode === opt.key}
+                onClick={() => {
+                  setMode(opt.key);
+                  setPreview(null);
+                }}
+                className={cn(
+                  "rounded-lg px-3 py-2 text-left transition-colors",
+                  mode === opt.key
+                    ? "bg-[var(--aurora-accent)]/18 text-foreground border border-[var(--aurora-accent)]/30"
+                    : "text-muted-foreground hover:text-foreground border border-transparent"
+                )}
+              >
+                <div className="text-[12.5px] font-medium">{opt.label}</div>
+                <div className="text-[10.5px] opacity-70">{opt.hint}</div>
+              </button>
+            ))}
+          </div>
+
           <Textarea
             value={instruction}
             onChange={(e) => setInstruction(e.target.value)}
-            placeholder="mis. tambahkan sesi door prize setelah talkshow dan arak-arakan penutup"
+            placeholder={placeholder}
             rows={3}
             className="text-[13px] bg-white/[0.04] border-white/10 resize-none"
-            aria-label="Instruksi segmen tambahan"
+            aria-label="Instruksi perubahan"
           />
+
+          {ai.isPending && (
+            <div
+              className="rounded-xl border border-[var(--aurora-accent)]/20 bg-[var(--aurora-accent)]/[0.06] p-3.5 space-y-1.5"
+              aria-live="polite"
+            >
+              <div className="flex items-center gap-2 text-[11.5px] font-medium text-[var(--aurora-accent)]">
+                <Loader2 className="size-3.5 animate-spin" />
+                Agent bekerja — status live
+              </div>
+              <div className="space-y-1 max-h-[150px] overflow-y-auto">
+                {ai.phases.map((p, i) => (
+                  <div
+                    key={`${p.phase}-${i}`}
+                    className="flex items-center gap-2 text-[12px] text-muted-foreground"
+                  >
+                    <span
+                      className={cn(
+                        "size-1.5 rounded-full",
+                        i === ai.phases.length - 1
+                          ? "bg-[var(--aurora-accent)] animate-pulse"
+                          : "bg-[var(--aurora-accent)]/40"
+                      )}
+                    />
+                    <span className="text-foreground/90">{p.label}</span>
+                    {p.detail && (
+                      <span className="text-muted-foreground/70 text-[11px]">{p.detail}</span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {preview && !ai.isPending && (
+            <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3.5 space-y-2.5">
+              <div className="flex items-center justify-between">
+                <div className="text-[12.5px] font-medium flex items-center gap-2">
+                  <Check className="size-4 text-[var(--aurora-accent)]" />
+                  {mode === "replan" ? "Jadwal baru siap diterapkan" : "Segmen baru siap ditambahkan"}
+                </div>
+                <Badge variant="secondary" className="text-[10.5px]">
+                  {preview.segments.length} segmen
+                </Badge>
+              </div>
+              <div className="max-h-[180px] overflow-y-auto space-y-1 pr-1">
+                {preview.segments.map((s) => (
+                  <div
+                    key={s.title}
+                    className="flex items-center justify-between text-[12px] px-2.5 py-1.5 rounded-lg bg-white/[0.03]"
+                  >
+                    <span className="truncate">{s.title}</span>
+                    <span className="text-muted-foreground text-[11px] shrink-0 ml-2">
+                      {formatDurationIndo(s.durationMinutes)}
+                    </span>
+                  </div>
+                ))}
+              </div>
+              <div className="text-[10.5px] text-muted-foreground/60">
+                {mode === "replan"
+                  ? "Menerapkan akan mengganti seluruh segmen dengan susunan di atas."
+                  : "Segmen di atas akan ditambahkan setelah segmen yang ada."}
+              </div>
+            </div>
+          )}
+
           <div className="flex justify-end gap-2">
-            <Button variant="outline" className="h-9 border-white/12" onClick={() => onOpenChange(false)}>
+            <Button
+              variant="outline"
+              className="h-9 border-white/12"
+              onClick={() => onOpenChange(false)}
+            >
               Batal
             </Button>
-            <Button
-              onClick={run}
-              disabled={generateAI.isPending || !instruction.trim()}
-              className="h-9 bg-[var(--aurora-accent)] hover:bg-[var(--aurora-accent)]/85 text-white"
-            >
-              {generateAI.isPending ? (
-                <Loader2 className="size-4 animate-spin" />
-              ) : (
-                <Sparkles className="size-4" />
-              )}
-              Susun segmen
-            </Button>
+            {preview && !ai.isPending ? (
+              <Button
+                onClick={apply}
+                disabled={applying}
+                className="h-9 bg-[var(--aurora-accent)] hover:bg-[var(--aurora-accent)]/85 text-white"
+              >
+                {applying ? (
+                  <Loader2 className="size-4 animate-spin" />
+                ) : (
+                  <Check className="size-4" />
+                )}
+                {mode === "replan" ? "Terapkan jadwal baru" : "Tambahkan segmen"}
+              </Button>
+            ) : (
+              <Button
+                onClick={run}
+                disabled={ai.isPending || !instruction.trim()}
+                className="h-9 bg-[var(--aurora-accent)] hover:bg-[var(--aurora-accent)]/85 text-white"
+              >
+                {ai.isPending ? (
+                  <Loader2 className="size-4 animate-spin" />
+                ) : (
+                  <Sparkles className="size-4" />
+                )}
+                {mode === "replan" ? "Atur ulang" : "Susun segmen"}
+              </Button>
+            )}
           </div>
         </div>
       </DialogContent>
@@ -770,7 +922,7 @@ export function RundownEditor({ rundownId }: { rundownId: string }) {
               onClick={() => setAiOpen(true)}
             >
               <Sparkles className="size-3.5 text-[var(--aurora-accent)]" />
-              Tambah dengan AI
+              Sesuaikan dengan AI
             </Button>
           </div>
 

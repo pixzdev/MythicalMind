@@ -23,7 +23,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Skeleton } from "@/components/ui/skeleton";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import {
   CalendarDays,
@@ -37,6 +36,7 @@ import {
   Users,
   Target,
   FileDown,
+  Loader2,
 } from "lucide-react";
 import {
   RUNDOWN_TEMPLATES,
@@ -50,12 +50,12 @@ import {
 } from "@/lib/rundown/time";
 import {
   useCreateRundown,
-  useGenerateRundownAI,
+  useAIRundownStream,
   type CreateRundownInput,
 } from "@/hooks/mythicalmind/rundown-queries";
 import { useProviders, useSettings } from "@/hooks/mythicalmind/queries";
 import { useWorkspace } from "@/store/workspace-store";
-import type { AIRundownResult, SegmentInput } from "@/lib/types";
+import type { SegmentInput } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 const CATEGORY_OPTIONS = [
@@ -206,7 +206,7 @@ export function RundownWizard() {
   const { data: settings } = useSettings();
 
   const createRundown = useCreateRundown();
-  const generateAI = useGenerateRundownAI();
+  const generateAI = useAIRundownStream();
 
   // template form
   const [templateDate, setTemplateDate] = useState("");
@@ -278,35 +278,30 @@ export function RundownWizard() {
     });
   };
 
-  const runAI = () => {
+  const runAI = async () => {
     if (!aiTitle.trim() || !aiEventType.trim()) return;
-    generateAI.mutate(
-      {
-        title: aiTitle.trim(),
-        eventType: aiEventType.trim(),
-        category: aiCategory,
-        startTime: aiStartTime || null,
-        targetDurationMinutes: Number(aiDuration) || null,
-        eventDate: aiDate ? new Date(`${aiDate}T00:00:00`).toISOString() : null,
-        audience: aiAudience.trim() || null,
-        goal: aiGoal.trim() || null,
-        notes: aiNotes.trim() || null,
-        mode: "full",
-      },
-      {
-        onSuccess: (data) => {
-          const r: AIRundownResult = data.rundown;
-          setAiResult({
-            title: r.title,
-            segments: r.segments,
-            startTime: r.suggestedStartTime || aiStartTime || "08:00",
-            description: r.description,
-            provider: r.providerName,
-            model: r.modelKey,
-          });
-        },
-      }
-    );
+    const r = await generateAI.run({
+      title: aiTitle.trim(),
+      eventType: aiEventType.trim(),
+      category: aiCategory,
+      startTime: aiStartTime || null,
+      targetDurationMinutes: Number(aiDuration) || null,
+      eventDate: aiDate ? new Date(`${aiDate}T00:00:00`).toISOString() : null,
+      audience: aiAudience.trim() || null,
+      goal: aiGoal.trim() || null,
+      notes: aiNotes.trim() || null,
+      mode: "full",
+    });
+    if (r) {
+      setAiResult({
+        title: r.title,
+        segments: r.segments,
+        startTime: r.suggestedStartTime || aiStartTime || "08:00",
+        description: r.description,
+        provider: r.providerName,
+        model: r.modelKey,
+      });
+    }
   };
 
   const saveAIResult = () => {
@@ -560,19 +555,52 @@ export function RundownWizard() {
                         className="h-9 text-[13px] bg-white/[0.04] border-white/10"
                       />
                     </div>
-                    <div className="space-y-1.5">
+                    <div className="space-y-1.5 sm:col-span-2">
                       <Label htmlFor="ai-notes" className="text-[11.5px] text-muted-foreground">
                         Catatan khusus (opsional)
                       </Label>
-                      <Input
+                      <Textarea
                         id="ai-notes"
                         value={aiNotes}
                         onChange={(e) => setAiNotes(e.target.value)}
                         placeholder="mis. ada sesi door prize, 3 narasumber"
-                        className="h-9 text-[13px] bg-white/[0.04] border-white/10"
+                        rows={3}
+                        className="text-[13px] bg-white/[0.04] border-white/10 resize-none"
                       />
                     </div>
                   </div>
+
+                  {generateAI.isPending && (
+                    <div
+                      className="rounded-xl border border-[var(--aurora-accent)]/20 bg-[var(--aurora-accent)]/[0.06] p-3.5 space-y-1.5"
+                      aria-live="polite"
+                    >
+                      <div className="flex items-center gap-2 text-[11.5px] font-medium text-[var(--aurora-accent)]">
+                        <Loader2 className="size-3.5 animate-spin" />
+                        Agent bekerja — status live
+                      </div>
+                      <div className="space-y-1 max-h-[132px] overflow-y-auto">
+                        {generateAI.phases.map((p, i) => (
+                          <div
+                            key={`${p.phase}-${i}`}
+                            className="flex items-center gap-2 text-[12px] text-muted-foreground"
+                          >
+                            <span
+                              className={`size-1.5 rounded-full ${
+                                i === generateAI.phases.length - 1
+                                  ? "bg-[var(--aurora-accent)] animate-pulse"
+                                  : "bg-[var(--aurora-accent)]/40"
+                              }`}
+                            />
+                            <span className="text-foreground/90">{p.label}</span>
+                            {p.detail && (
+                              <span className="text-muted-foreground/70 text-[11px]">{p.detail}</span>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
 
                   <div className="flex justify-end gap-2 pt-1">
                     <Button variant="outline" className="h-9 border-white/12" onClick={close}>
@@ -585,9 +613,9 @@ export function RundownWizard() {
                     >
                       {generateAI.isPending ? (
                         <>
-                          <Skeleton className="size-4 rounded-full bg-white/25" />
+                          <Loader2 className="size-4 animate-spin" />
                           AI sedang menyusun…
-                        </>
+                          </>
                       ) : (
                         <>
                           <Sparkles className="size-4" />
