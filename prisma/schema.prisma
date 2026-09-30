@@ -1,0 +1,220 @@
+// MythicalMind — personal AI workspace
+// Persistence: rundowns (event + daily plans), segments, conversations,
+// messages, generations, providers, models, agents, activity, settings.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Rundown Studio — the productivity core
+// ---------------------------------------------------------------------------
+
+// A rundown is a time-based plan: an event agenda OR a personal daily plan.
+// Segment times are DERIVED from rundown.startTime + cumulative durations,
+// so the timeline is always internally consistent.
+model Rundown {
+  id                  String    @id @default(cuid())
+  title               String
+  category            String    @default("acara") // acara | harian | studi | kerja
+  eventType           String    @default("custom") // wedding | seminar | meeting | daily | ...
+  description         String?
+  eventDate           DateTime?
+  venue               String?
+  organizer           String?
+  startTime           String    @default("08:00") // HH:mm
+  status              String    @default("draft") // draft | final
+  source              String    @default("manual") // manual | template | ai
+  segmentCount        Int       @default(0)
+  totalMinutes        Int       @default(0)
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  segments Segment[]
+
+  @@index([category, updatedAt])
+  @@index([eventDate])
+  @@map("rundowns")
+}
+
+model Segment {
+  id              String   @id @default(cuid())
+  rundownId       String
+  rundown         Rundown @relation(fields: [rundownId], references: [id], onDelete: Cascade)
+  sortOrder       Int      @default(0)
+  durationMinutes Int      @default(15)
+  title           String
+  description     String?
+  pic             String?
+  notes           String?
+  materials       String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([rundownId, sortOrder])
+  @@map("segments")
+}
+
+// ---------------------------------------------------------------------------
+// Infrastructure
+// ---------------------------------------------------------------------------
+
+model Provider {
+  id           String   @id @default(cuid())
+  name         String
+  type         String   @default("openai-compatible")
+  baseUrl      String
+  apiKey       String   @default("")
+  defaultModel String?
+  customHeaders String? @default("{}") // JSON: { "Header-Name": "value" }
+  // last connection test result (real, from provider /test endpoint)
+  status       String   @default("unverified") // unverified | connected | error
+  statusDetail String?
+  lastTestedAt DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  models Model[]
+
+  @@map("providers")
+}
+
+model Model {
+  id            String   @id @default(cuid())
+  providerId    String
+  provider      Provider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  modelId       String   // the id sent to the API, e.g. "gpt-4o-mini"
+  name          String
+  contextWindow Int?
+  vision        Boolean  @default(false)
+  reasoning     Boolean  @default(false)
+  tools         Boolean  @default(false)
+  streaming     Boolean  @default(true)
+  createdAt     DateTime @default(now())
+
+  @@unique([providerId, modelId])
+  @@map("models")
+}
+
+// ---------------------------------------------------------------------------
+// Workspace
+// ---------------------------------------------------------------------------
+
+model Conversation {
+  id           String   @id @default(cuid())
+  title        String   @default("New conversation")
+  agentId      String?
+  agent        Agent?   @relation(fields: [agentId], references: [id], onDelete: SetNull)
+  systemPrompt String?
+  // currently selected provider + model for the next generation
+  providerId   String?
+  modelKey     String?
+  archived     Boolean  @default(false)
+  messageCount Int      @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  messages    Message[]
+  generations Generation[]
+
+  @@index([archived, updatedAt])
+  @@map("conversations")
+}
+
+model Message {
+  id             String   @id @default(cuid())
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  role           String   // user | assistant | system
+  content        String   @default("")
+  reasoning      String?  // reasoning tokens (when the provider sends them)
+  status         String   @default("completed") // streaming | completed | failed | cancelled
+  generationId   String?
+  providerId     String?
+  providerName   String?
+  modelKey       String?
+  usage          String?  // JSON { inputTokens?, outputTokens?, totalTokens? }
+  error          String?  // JSON { code, message, hint? }
+  sortOrder      Int      @default(0)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([conversationId, sortOrder])
+  @@map("messages")
+}
+
+// One row per generation run. The in-memory runtime holds live state;
+// this table is the durable record + the source for the Tasks view.
+model Generation {
+  id             String   @id @default(cuid())
+  conversationId String
+  messageId      String?
+  providerId     String
+  providerName   String
+  modelKey       String
+  status         String   @default("streaming") // queued | streaming | completed | failed | cancelled
+  outputChars    Int      @default(0)
+  usage          String?  // JSON
+  error          String?  // JSON { code, message, hint? }
+  durationMs     Int?
+  startedAt      DateTime @default(now())
+  endedAt        DateTime?
+  createdAt      DateTime @default(now())
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([status])
+  @@index([startedAt])
+  @@map("generations")
+}
+
+// Agent = reusable persona: system prompt + default model settings.
+// Starting a conversation from an agent seeds it — a real feature, not a stub.
+model Agent {
+  id           String   @id @default(cuid())
+  name         String
+  description  String?
+  systemPrompt String
+  temperature  Float?
+  providerId   String?
+  modelKey     String?
+  icon         String   @default("sparkles")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  conversations Conversation[]
+
+  @@map("agents")
+}
+
+// ---------------------------------------------------------------------------
+// System
+// ---------------------------------------------------------------------------
+
+// User-facing runtime overview — real events emitted by the runtime only.
+model ActivityEvent {
+  id             String   @id @default(cuid())
+  type           String   // generation.started | generation.completed | provider.connected | ...
+  level          String   @default("info") // info | success | warn | error
+  title          String
+  detail         String?
+  conversationId String?
+  conversationTitle String?
+  generationId   String?
+  providerId     String?
+  createdAt      DateTime @default(now())
+
+  @@index([createdAt])
+  @@map("activity_events")
+}
+
+model Setting {
+  key   String @id
+  value String // JSON-encoded
+  @@map("settings")
+}
